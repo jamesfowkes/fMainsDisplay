@@ -217,13 +217,13 @@ static void initialiseDisplay(void)
 		TLC5916_ClockOut(displayBytes, 5, &s_tlc);
 	}
 	
-	SSEG_AddDecimal(&displayBytes[2], &map);
+	SSEG_AddDecimal(&displayBytes[2], &map, true);
 	TLC5916_OutputEnable(&s_tlc, true);
 }
 
 static void calculateFrequency(void)
 {
-	// The pin change interrupt counts twice per interrupt, divide s_kHzCount by 2
+	// The pin change interrupt counts twice per mains cycle (rising and falling), divide s_kHzCount by 2
 	// which means mutiplying derived mains freq by 2.
 	// Multiply by DISPLAY_FIXED_POINT_MULTIPLIER to shift calculated frequency into fixed point range
 	
@@ -272,7 +272,7 @@ static void updateDisplay(void)
 		displayBytes[place] = s_displayMap[digit];
 	}
 	
-	SSEG_AddDecimal(&displayBytes[2], &map);
+	SSEG_AddDecimal(&displayBytes[2], &map, true);
 	
 	TLC5916_ClockOut(displayBytes, 5, &s_tlc);
 }
