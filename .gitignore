@@ -3,6 +3,17 @@
 *.exe
 *.hex
 *.elf
+*.d
+*.map
+*.lss
+*.eep
+*.s
 
-#LUFA Library
-LUFA/*
+## Makefiles ##
+makefile
+
+## Eclipse files ##
+.cproject
+.project
+*.prefs
+*.mk
