@@ -1,12 +1,21 @@
 /*
+ * main.c
+ *
+ *  Startup file for display to show mains frequency
+ */
+
+/*
  * Standard Library Includes
  */
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
 /*
  * AVR Includes (Defines and Primitives)
  */
+ 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/wdt.h>
@@ -19,13 +28,6 @@
 #include "seven_segment_map.h"
 
 /*
- * AVR Library Includes
- */
- 
-#include "lib_clk.h"
-#include "lib_tmr8_tick.h"
-
-/*
  * Device Includes
  */
 
@@ -33,54 +35,75 @@
 #include "lib_tlc5916.h"
 
 /*
- * Common Library Includes
+ * AVR Library Includes
  */
 
- #include "lib_shiftregister.h"
+#include "lib_io.h"
+#include "lib_clk.h"
+#include "lib_shiftregister.h"
+#include "lib_pcint.h"
+#include "lib_extint.h"
 
 /*
  * Defines and Typedefs
  */
 
-#define IDEAL_SECONDS (2U)	// How seconds we should be counting for
-#define IDEAL_F_MAINS (50U)	// Ideal mains frequency
+#define IDEAL_SECONDS (2UL)	// How seconds we should be counting for
+#define IDEAL_F_MAINS (50UL)	// Ideal mains frequency
 #define IDEAL_CYCLES (IDEAL_F_MAINS * IDEAL_SECONDS)	// The number of mains cycles to count
 
 #define IDEAL_F_CLK (32768UL)	// Frequency of the incoming clock
-#define IDEAL_COUNTS (IDEAL_SECONDS * IDEAL_F_CLK)	// If mains is exactly 50Hz, should count exactly this many clocks in time period
+#define IDEAL_32KHZ_COUNTS (IDEAL_SECONDS * IDEAL_F_CLK)	// If mains is exactly 50Hz, should count exactly this many clocks in time period
 
-#define HISTORY_SAMPLES (32) // Needs to be power of two for ring buffer. 32 samples is close enouugh to 1 minute of data
+#define HISTORY_SAMPLES (32) // Needs to be power of two for ring buffer. 32 samples is close enough to 1 minute of data
 
-#define DISPLAY_FIXED_POINT_MULTIPLIER (1000U)
+#define DISPLAY_FIXED_POINT_MULTIPLIER (1000UL)
 
-// Mains input on INT0
+// Correction to apply to kHz count before storage and display (based on
+// calibration with http://www.dynamicdemand.co.uk/grid.htm)
+#define CORRECTION_FACTOR (680)
+
+// Mains input
 #define MAINS_PORT IO_PORTB
 #define MAINS_PIN 2
-#define MAINS_INT_MASK (1 << INT0)
+#define MAINS_PCINT_NUMBER 10
 
-// 32768Hz input on PCINT7
+// 32768Hz input
 #define CLK_PORT IO_PORTA
 #define CLK_PIN 7
-#define CLK_INT_MASK (1 << PCINT7)
+#define CLK_PCINT_NUMBER 7
 
 // Shift register clock and data
-#define TLC_DATA_PORT &PORTA
-#define TLC_DATA_PIN 0
-#define TLC_CLK_PORT &PORTA
-#define TLC_CLK_PIN 1
+#define TLC_CLK_PORT PORTB
+#define TLC_DATA_PORT PORTA
+#define TLC_LATCH_PORT PORTA
 #define TLC_OE_PORT PORTA
-#define TLC_OE_PIN 2
-#define TLC_LAT_PORT PORTA
-#define TLC_LAT_PIN 3
 
-// Up/Down LED outputs
-#define UP_PORT PORTA
-#define UP_PIN 4
+#define eTLC_CLK_PORT IO_PORTB
+#define eTLC_DATA_PORT IO_PORTA
+#define eTLC_LATCH_PORT IO_PORTA
+#define eTLC_OE_PORT IO_PORTA
+
+#define TLC_DATA_PIN 1
+#define TLC_CLK_PIN 0
+#define TLC_OE_PIN 3
+#define TLC_LATCH_PIN 2
+
+// Up/down LEDs
+#define UP_PORT PORTB
+#define eUP_PORT IO_PORTB
+#define UP_PIN 1
 #define DN_PORT PORTA
-#define DN_PIN 5
+#define eDN_PORT IO_PORTA
+#define DN_PIN 0
 
-#define enableApplicationInterrupts() (GIMSK |= (MAINS_INT_MASK | CLK_INT_MASK))
-#define disableApplicationInterrupts() (GIMSK &= ~(MAINS_INT_MASK | CLK_INT_MASK))
+enum state_enum
+{
+	COUNT,
+	DISPLAY,
+	WAIT_FOR_SYNC
+};
+typedef enum state_enum STATE_ENUM;
 
 /*
  * Private Function Prototypes
@@ -91,83 +114,81 @@ static void initialiseDisplay(void);
 static void initialiseBuffer(void);
 
 static void calculateFrequency(void);
-
 static void updateUpDn(void);
 static void updateDisplay(void);
 static void setupIO(void);
-static void resetCount(void);
 
 static void tlcOEFn(bool on);
 static void tlcLatchFn(bool on);
+static void tlcNullFn(bool on);
 
 /*
  * Private Variables
  */
 
-static SEVEN_SEGMENT_MAP map = 
-	{
-		0, // A
-		1, // B
-		2, // C
-		3, // D
-		4, // E
-		5, // F
-		6, // G
-		7, // DP
-	};
+static SEVEN_SEGMENT_MAP map =
+{
+	0, // A
+	1, // B
+	3, // C
+	4, // D
+	5, // E
+	7, // F
+	6, // G
+	2, // DP
+};
 
 static uint8_t s_displayMap[10];
-static uint16_t s_kHzCount = 0;
-static uint16_t s_cycleCount = 0;
+static volatile uint32_t s_kHzCount = 0;
+static volatile uint16_t s_cycleCount = 0;
 
 static RING_BUFFER s_frequencyHistory;
 static uint16_t s_freqData[HISTORY_SAMPLES];
 
-static volatile bool s_updateDisplayFlag = false;
+static volatile STATE_ENUM s_state = WAIT_FOR_SYNC;
 
-static TLC5916_CONTROL s_tlc = {
-	.sr.shiftOutFn = SR_ShiftOut,
-	.latch = tlcLatchFn,
-	.oe = tlcOEFn
-};
+static TLC5916_CONTROL s_tlc;
 
 int main(void)
 {
 	
 	CLK_Init(0);
-	
+
 	initialiseMap();
-	
+
 	initialiseBuffer();
-	
+
 	setupIO();
-	
-	resetCount();
-	
+
 	sei();
+	
+	wdt_disable();
 	
 	while (true)
 	{
-		if (s_updateDisplayFlag)
+		if (s_state == DISPLAY)
 		{
-			s_updateDisplayFlag = false;
+			cli();
+			
 			calculateFrequency();
 			updateUpDn();
 			updateDisplay();
-			resetCount();
-			enableApplicationInterrupts();
+			
+			s_state = WAIT_FOR_SYNC;
+			sei();
 		}
 	}
-	
+
 	return 0;
 }
 
 static void initialiseBuffer(void)
 {
-	uint8_t i;
-	
-	Ringbuf_Init(&s_frequencyHistory, (RINGBUF_DATA)s_freqData, sizeof(uint16_t), HISTORY_SAMPLES, true);
-	
+
+	uint8_t i = 0;
+
+	Ringbuf_Init(&s_frequencyHistory, (uint8_t*)s_freqData, sizeof(uint16_t), HISTORY_SAMPLES, true);
+
 	// Fill the buffer with ideal frequency values
 	for (i = 0; i < HISTORY_SAMPLES; ++i)
 	{
@@ -178,7 +199,7 @@ static void initialiseBuffer(void)
 static void initialiseMap(void)
 {
 	uint8_t i;
-	
+
 	for (i = 0; i < 10; ++i)
 	{
 		s_displayMap[i] = SSEG_CreateDigit(i, &map, true);
@@ -187,57 +208,59 @@ static void initialiseMap(void)
 
 static void setupIO(void)
 {
-	IO_SetMode(MAINS_PORT, MAINS_PIN, IO_MODE_INPUT);
-	IO_SetMode(CLK_PORT, CLK_PIN, IO_MODE_INPUT);
+	IO_SetMode(eTLC_DATA_PORT, TLC_DATA_PIN, IO_MODE_OUTPUT);
+	IO_SetMode(eTLC_CLK_PORT, TLC_CLK_PIN, IO_MODE_OUTPUT);
+	IO_SetMode(eTLC_OE_PORT, TLC_OE_PIN, IO_MODE_OUTPUT);
+	IO_SetMode(eTLC_LATCH_PORT, TLC_LATCH_PIN, IO_MODE_OUTPUT);
+
+	IO_SetMode(eUP_PORT, UP_PIN, IO_MODE_OUTPUT);
+	IO_SetMode(eDN_PORT, DN_PIN, IO_MODE_OUTPUT);
 	
-	SR_Init(TLC_DATA_PORT, TLC_DATA_PIN, TLC_CLK_PORT, TLC_CLK_PIN);
+	SR_Init(SFRP(TLC_CLK_PORT), TLC_CLK_PIN, SFRP(TLC_DATA_PORT), TLC_DATA_PIN);
 	
 	initialiseDisplay();
-	
-	// Set INT0 sense control to falling edge
-	MCUCR &= ~((1 << ISC01) | (1 << ISC00));
-	MCUCR |= (1 << ISC01);
-	
-	// Set PCINT interrupt
-	PCMSK0 |= (1 << PCINT7);
-	GIMSK |= (1 << PCIE0);
-	
-	enableApplicationInterrupts();
+
+	PCINT_EnableInterrupt(MAINS_PCINT_NUMBER, true);
+	PCINT_EnableInterrupt(CLK_PCINT_NUMBER, true);	
 }
 
 static void initialiseDisplay(void)
 {
 	uint8_t displayBytes[] = {5, 0, 0, 0, 0};
+
+	uint8_t digit = 0;
 	
-	uint16_t digit = 0;
+	s_tlc.sr.shiftOutFn = SR_ShiftOut;
+	s_tlc.sr.clkFn = tlcNullFn;
+	s_tlc.sr.dataFn = tlcNullFn;
+	s_tlc.latch = tlcLatchFn;
+	s_tlc.oe = tlcOEFn;
 	
-	for (digit = 0; digit < 4; digit++)
-	{
-		displayBytes[digit] = s_displayMap[digit];
-		TLC5916_ClockOut(displayBytes, 5, &s_tlc);
-	}
-	
-	SSEG_AddDecimal(&displayBytes[2], &map, true);
 	TLC5916_OutputEnable(&s_tlc, true);
+	
+	for (digit = 0; digit < 5; digit++)
+	{
+		displayBytes[digit] = s_displayMap[ displayBytes[digit] ];		
+	}
+
+	SSEG_AddDecimal(&displayBytes[1], &map, true);
+	
+	TLC5916_ClockOut(displayBytes, 5, &s_tlc);
 }
 
 static void calculateFrequency(void)
 {
-	// The pin change interrupt counts twice per mains cycle (rising and falling), divide s_kHzCount by 2
-	// which means mutiplying derived mains freq by 2.
 	// Multiply by DISPLAY_FIXED_POINT_MULTIPLIER to shift calculated frequency into fixed point range
-	
-	uint16_t newFreq = IDEAL_COUNTS * DISPLAY_FIXED_POINT_MULTIPLIER * IDEAL_F_MAINS * 2 / s_kHzCount;
-	
-	Ringbuf_Put(&s_frequencyHistory, (uint8_t *)&newFreq);
-	
+	s_kHzCount /= 2;
+	uint16_t newFreq = (uint16_t)(IDEAL_32KHZ_COUNTS * DISPLAY_FIXED_POINT_MULTIPLIER * IDEAL_F_MAINS / s_kHzCount);
+	Ringbuf_Put(&s_frequencyHistory, (uint8_t*)&newFreq);
 }
 
 static void updateUpDn(void)
 {
 	uint16_t newFreq = *(Ringbuf_Get_Newest(&s_frequencyHistory));
 	uint16_t oldFreq = *(Ringbuf_Get_Oldest(&s_frequencyHistory));
-	
+
 	if (newFreq > oldFreq)
 	{
 		IO_On(UP_PORT, UP_PIN);
@@ -257,46 +280,51 @@ static void updateUpDn(void)
 
 static void updateDisplay(void)
 {
-	uint16_t freq = *(Ringbuf_Get_Newest(&s_frequencyHistory));
-	
+	uint16_t freq = *(uint16_t*)(Ringbuf_Get_Newest(&s_frequencyHistory));
+
 	uint8_t displayBytes[] = {0, 0, 0, 0, 0};
 	uint16_t values[] = {10000, 1000, 100, 10, 1};
 	uint8_t place = 0;
 	uint8_t digit = 0;
-	
+
 	for (place = 0; place < 5; place++)
 	{
 		digit = (uint8_t)(freq / values[place]);
 		freq -= (digit * values[place]);
-		
+
 		displayBytes[place] = s_displayMap[digit];
 	}
-	
-	SSEG_AddDecimal(&displayBytes[2], &map, true);
-	
+
+	SSEG_AddDecimal(&displayBytes[1], &map, true);
+
 	TLC5916_ClockOut(displayBytes, 5, &s_tlc);
 }
 
-static void resetCount(void)
-{
-	s_kHzCount = 0;
-	s_cycleCount = 0;
-}
-
-/* IO functions for TLC5916 */
+/* IO functions for s_tlc5916 */
 static void tlcOEFn(bool on) { on ? IO_On(TLC_OE_PORT, TLC_OE_PIN) : IO_Off(TLC_OE_PORT, TLC_OE_PIN); }
-static void tlcLatchFn(bool on) { on ? IO_On(TLC_LAT_PORT, TLC_LAT_PIN) : IO_Off(TLC_LAT_PORT, TLC_LAT_PIN); }
+static void tlcLatchFn(bool on) { on ? IO_On(TLC_LATCH_PORT, TLC_LATCH_PIN) : IO_Off(TLC_LATCH_PORT, TLC_LATCH_PIN); }
+static void tlcNullFn(bool on) { (void)on; }
 
-ISR(EXT_INT0_vect)
+ISR(PCINT0_vect) // Clock 32768Hz vector
 {
-	if (++s_cycleCount == IDEAL_CYCLES)
+	if (s_state == COUNT)
 	{
-		disableApplicationInterrupts();
-		s_updateDisplayFlag = true;
+		s_kHzCount++;
 	}
 }
 
-ISR(PCINT0_vect)
+ISR(PCINT1_vect) // Mains 50Hz vector
 {
-	s_kHzCount++;
+	if (s_state == WAIT_FOR_SYNC)
+	{
+		s_kHzCount = 0;
+		s_cycleCount = 0;
+		s_state = COUNT;
+	}
+	
+	if (++s_cycleCount == (IDEAL_CYCLES * 2))
+	{
+		s_kHzCount += CORRECTION_FACTOR;
+		s_state = DISPLAY;
+	}
 }
