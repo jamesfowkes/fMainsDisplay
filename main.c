@@ -45,11 +45,15 @@
 #include "lib_extint.h"
 
 /*
+ * Local Application Includes
+ */
+
+#include "application.h"
+
+/*
  * Defines and Typedefs
  */
 
-#define IDEAL_SECONDS (2UL)	// How seconds we should be counting for
-#define IDEAL_F_MAINS (50UL)	// Ideal mains frequency
 #define IDEAL_CYCLES (IDEAL_F_MAINS * IDEAL_SECONDS)	// The number of mains cycles to count
 
 #define IDEAL_F_CLK (32768UL)	// Frequency of the incoming clock
@@ -111,7 +115,6 @@ typedef enum state_enum STATE_ENUM;
 
 static void initialiseMap(void);
 static void initialiseDisplay(void);
-static void initialiseBuffer(void);
 
 static void calculateFrequency(void);
 static void updateUpDn(void);
@@ -141,9 +144,7 @@ static SEVEN_SEGMENT_MAP map =
 static uint8_t s_displayMap[10];
 static volatile uint32_t s_kHzCount = 0;
 static volatile uint16_t s_cycleCount = 0;
-
-static RING_BUFFER s_frequencyHistory;
-static uint16_t s_freqData[HISTORY_SAMPLES];
+static uint16_t s_lastFreq;
 
 static volatile STATE_ENUM s_state = WAIT_FOR_SYNC;
 
@@ -156,7 +157,7 @@ int main(void)
 
 	initialiseMap();
 
-	initialiseBuffer();
+	FreqData_Init();
 
 	setupIO();
 
@@ -180,20 +181,6 @@ int main(void)
 	}
 
 	return 0;
-}
-
-static void initialiseBuffer(void)
-{
-
-	uint8_t i = 0;
-
-	Ringbuf_Init(&s_frequencyHistory, (uint8_t*)s_freqData, sizeof(uint16_t), HISTORY_SAMPLES, true);
-
-	// Fill the buffer with ideal frequency values
-	for (i = 0; i < HISTORY_SAMPLES; ++i)
-	{
-		s_freqData[i] = (IDEAL_F_MAINS * DISPLAY_FIXED_POINT_MULTIPLIER);
-	}
 }
 
 static void initialiseMap(void)
@@ -246,42 +233,42 @@ static void initialiseDisplay(void)
 	SSEG_AddDecimal(&displayBytes[1], &map, true);
 	
 	TLC5916_ClockOut(displayBytes, 5, &s_tlc);
+	
+	IO_On(UP_PORT, UP_PIN);
+	IO_On(DN_PORT, DN_PIN);
 }
 
 static void calculateFrequency(void)
 {
 	// Multiply by DISPLAY_FIXED_POINT_MULTIPLIER to shift calculated frequency into fixed point range
+	s_kHzCount += CORRECTION_FACTOR;
 	s_kHzCount /= 2;
-	uint16_t newFreq = (uint16_t)(IDEAL_32KHZ_COUNTS * DISPLAY_FIXED_POINT_MULTIPLIER * IDEAL_F_MAINS / s_kHzCount);
-	Ringbuf_Put(&s_frequencyHistory, (uint8_t*)&newFreq);
+	s_lastFreq = (uint16_t)(IDEAL_32KHZ_COUNTS * DISPLAY_FIXED_POINT_MULTIPLIER * IDEAL_F_MAINS / s_kHzCount);
+	
+	FreqData_NewValue(s_lastFreq);
 }
 
 static void updateUpDn(void)
 {
-	uint16_t newFreq = *(Ringbuf_Get_Newest(&s_frequencyHistory));
-	uint16_t oldFreq = *(Ringbuf_Get_Oldest(&s_frequencyHistory));
-
-	if (newFreq > oldFreq)
+	switch( FreqData_GetTrend() )
 	{
+	case TREND_UP:
 		IO_On(UP_PORT, UP_PIN);
 		IO_Off(DN_PORT, DN_PIN);
-	}
-	else if (newFreq < oldFreq)
-	{
+		break;
+	case TREND_DN:
 		IO_Off(UP_PORT, UP_PIN);
 		IO_On(DN_PORT, DN_PIN);
-	}
-	else
-	{
+		break;
+	case TREND_NONE:
 		IO_Off(UP_PORT, UP_PIN);
 		IO_Off(DN_PORT, DN_PIN);
+		break;
 	}
 }
 
 static void updateDisplay(void)
 {
-	uint16_t freq = *(uint16_t*)(Ringbuf_Get_Newest(&s_frequencyHistory));
-
 	uint8_t displayBytes[] = {0, 0, 0, 0, 0};
 	uint16_t values[] = {10000, 1000, 100, 10, 1};
 	uint8_t place = 0;
@@ -289,8 +276,8 @@ static void updateDisplay(void)
 
 	for (place = 0; place < 5; place++)
 	{
-		digit = (uint8_t)(freq / values[place]);
-		freq -= (digit * values[place]);
+		digit = (uint8_t)(s_lastFreq / values[place]);
+		s_lastFreq -= (digit * values[place]);
 
 		displayBytes[place] = s_displayMap[digit];
 	}
@@ -324,7 +311,6 @@ ISR(PCINT1_vect) // Mains 50Hz vector
 	
 	if (++s_cycleCount == (IDEAL_CYCLES * 2))
 	{
-		s_kHzCount += CORRECTION_FACTOR;
 		s_state = DISPLAY;
 	}
 }
