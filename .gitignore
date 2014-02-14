@@ -8,6 +8,7 @@
 *.lss
 *.eep
 *.s
+error.txt
 
 ## Makefiles ##
 makefile
